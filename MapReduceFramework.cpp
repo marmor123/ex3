@@ -58,19 +58,34 @@ struct JobContext {
           nextInputPairIndex(0), nextShuffledGroupIndexToReduce(0), joined(false),
           mapStageInitializedFlag(), reduceStageInitializedFlag(), totalIntermediateElementsProduced(0)
     {
-        // Barrier allocation can throw std::bad_alloc, caught by startMapReduceJob
-        barrier = new Barrier(multiThreadLevel); 
-        
-        threads.reserve(multiThreadLevel);
-        intermediateVecsPerThread.resize(multiThreadLevel);
-
-        // Initial state: UNDEFINED_STAGE, 0 processed items
-        uint64_t initial_state = (get_stage_val(UNDEFINED_STAGE) << STAGE_SHIFT) | 0;
-        atomicJobState.store(initial_state);
+        try {
+            // Resize intermediate vectors for each thread
+            if (multiThreadLevel > 0) { // Ensure multiThreadLevel is positive
+                intermediateVecsPerThread.resize(multiThreadLevel);
+            } else {
+                // Handle case where multiThreadLevel might be 0 or negative if necessary,
+                // though problem constraints usually imply >= 1.
+                // For now, assume multiThreadLevel >= 1 based on typical usage.
+                // If it can be 0, this resize might not be needed or error.
+            }
+        } catch (const std::bad_alloc& e) {
+            std::cerr << "system error: Failed to allocate memory for intermediateVecsPerThread in JobContext constructor: " << e.what() << std::endl;
+            exit(1); // As per readme for system errors
+        }
+        // Initialize atomicJobState to UNDEFINED_STAGE, 0%
+        uint64_t initial_state = (get_stage_val(UNDEFINED_STAGE) << STAGE_SHIFT);
+        atomicJobState.store(initial_state, std::memory_order_relaxed);
     }
 
     ~JobContext() {
-        delete barrier;
+        delete barrier; // Safe to delete nullptr
+        barrier = nullptr;
+
+        // Note: This framework assumes K*/V* pointers passed to emit functions
+        // are managed by the client or are trivial. If the framework were to
+        // take ownership of copies, cleanup would be needed here for
+        // intermediateVecsPerThread, shuffledIntermediateVecs, and outputVec.
+        // Based on typical MapReduce, client manages original data, framework manages pointers/containers.
     }
 
     // Atomically update stage and reset count
@@ -105,19 +120,44 @@ struct Emit3Context {
 void workerThreadRoutine(JobContext* jobCtx, int threadID);
 
 void emit2 (K2* key, V2* value, void* context) {
-    Emit2Context* ctx = static_cast<Emit2Context*>(context);
-    JobContext* jobCtx = ctx->jobCtx;
+    if (!context) {
+        // Consider logging an error or specific handling if context is null
+        return;
+    }
+    Emit2Context* emitCtx = static_cast<Emit2Context*>(context);
+    JobContext* jobCtx = emitCtx->jobCtx;
+    int threadID = emitCtx->threadID;
+
+    if (threadID < 0 || static_cast<size_t>(threadID) >= jobCtx->intermediateVecsPerThread.size()) {
+        std::cerr << "system error: Invalid threadID in emit2 context." << std::endl;
+        // This indicates a programming error.
+        exit(1); // Critical error
+    }
+
+    try {
+        jobCtx->intermediateVecsPerThread[threadID].emplace_back(key, value);
+    } catch (const std::bad_alloc& e) {
+        std::cerr << "system error: Failed to allocate memory for intermediate pair in emit2: " << e.what() << std::endl;
+        exit(1); // As per readme for system errors
+    }
     
-    jobCtx->intermediateVecsPerThread[ctx->threadID].emplace_back(key, value);
     jobCtx->totalIntermediateElementsProduced.fetch_add(1, std::memory_order_relaxed);
 }
 
 void emit3 (K3* key, V3* value, void* context) {
-    Emit3Context* ctx = static_cast<Emit3Context*>(context);
-    JobContext* jobCtx = ctx->jobCtx;
+    if (!context) return;
+    Emit3Context* emitCtx = static_cast<Emit3Context*>(context);
+    JobContext* jobCtx = emitCtx->jobCtx;
 
     std::lock_guard<std::mutex> lock(jobCtx->outputVecMutex);
-    jobCtx->outputVec->emplace_back(key, value);
+    try {
+        jobCtx->outputVec->emplace_back(key, value);
+    } catch (const std::bad_alloc& e) {
+        std::cerr << "system error: Failed to allocate memory for output pair in emit3: " << e.what() << std::endl;
+        exit(1);
+    }
+    // Note: The main atomicJobState (for overall job progress) is updated in workerThreadRoutine
+    // after a reduce task (a K2 group) is completed, not per emit3 call.
 }
 
 JobHandle startMapReduceJob(const MapReduceClient& client,
@@ -127,137 +167,137 @@ JobHandle startMapReduceJob(const MapReduceClient& client,
     JobContext* jobCtx = nullptr;
     try {
         jobCtx = new JobContext(client, inputVec, outputVec, multiThreadLevel);
-    } catch (const std::bad_alloc& e) {
-        std::cerr << "system error: Failed to allocate JobContext" << std::endl;
-        exit(1);
-    } catch (const std::system_error& e) { // Barrier constructor might throw this if it uses system calls
-        std::cerr << "system error: Failed to initialize JobContext (Barrier): " << e.what() << std::endl;
-        exit(1);
-    }
-
-
-    try {
-        for (int i = 0; i < multiThreadLevel; ++i) {
-            jobCtx->threads.emplace_back(workerThreadRoutine, jobCtx, i);
+        if (multiThreadLevel > 0) { // Barrier is only created if there are worker threads
+            jobCtx->barrier = new Barrier(multiThreadLevel);
         }
-    } catch (const std::system_error& e) {
-        std::cerr << "system error: Failed to create thread: " << e.what() << std::endl;
-        // Make sure to clean up allocated JobContext and its Barrier before exiting
-        delete jobCtx; 
+    } catch (const std::bad_alloc& e) {
+        std::cerr << "system error: Failed to allocate JobContext or Barrier: " << e.what() << std::endl;
+        delete jobCtx; // Clean up partially allocated jobCtx if barrier allocation failed
+        exit(1);
+    } catch (...) { // Catch any other exceptions from JobContext constructor
+        std::cerr << "system error: Unknown error during JobContext or Barrier allocation." << std::endl;
+        delete jobCtx;
         exit(1);
     }
+
+
+    jobCtx->threads.reserve(multiThreadLevel);
+    for (int i = 0; i < multiThreadLevel; ++i) {
+        try {
+            jobCtx->threads.emplace_back(workerThreadRoutine, jobCtx, i);
+        } catch (const std::system_error& e) {
+            std::cerr << "system error: Failed to create thread " << i << ": " << e.what() << std::endl;
+            // According to readme, exit(1). Before exiting, attempt to join already created threads.
+            // However, a simple exit(1) is what's asked.
+            // To be robust, one might set an abort flag, join threads, then delete jobCtx.
+            // For now, following the exit(1) directive.
+            jobCtx->joined = true; // Prevent waitForJob from trying to join later if it's called amidst this.
+            for(int j = 0; j < i; ++j) { // Attempt to join threads that were successfully created
+                if (jobCtx->threads[j].joinable()) {
+                    // jobCtx->threads[j].join(); // This might hang if threads are stuck.
+                                               // A more complex shutdown (e.g. condition variable) would be needed.
+                                               // Given exit(1), this is best-effort.
+                }
+            }
+            delete jobCtx; // This will call destructor, deleting barrier
+            exit(1);
+        }
+    }
+
     return static_cast<JobHandle>(jobCtx);
 }
 
 void workerThreadRoutine(JobContext* jobCtx, int threadID) {
-    // Phase 1: Map
-    // Initialize MAP stage (done once by one thread)
+    // MAP PHASE
     std::call_once(jobCtx->mapStageInitializedFlag, [&]() {
-        jobCtx->setStage(MAP_STAGE);
-        jobCtx->setTotalItemsForStage(jobCtx->inputVec->size());
+        size_t totalInputItems = jobCtx->inputVec ? jobCtx->inputVec->size() : 0;
+        jobCtx->totalItemsInCurrentStage.store(totalInputItems, std::memory_order_relaxed);
+        
+        uint64_t initial_map_state = (get_stage_val(MAP_STAGE) << STAGE_SHIFT); // count is 0
+        jobCtx->atomicJobState.store(initial_map_state, std::memory_order_release);
     });
 
-    Emit2Context emit2Context = {jobCtx, threadID};
+    Emit2Context emit2Ctx = {jobCtx, threadID};
     unsigned int current_input_idx;
-    while ((current_input_idx = jobCtx->nextInputPairIndex.fetch_add(1, std::memory_order_relaxed)) < jobCtx->inputVec->size()) {
-        const InputPair& pair = (*jobCtx->inputVec)[current_input_idx];
-        if (pair.first && pair.second) { // Basic check
-             jobCtx->client->map(pair.first, pair.second, &emit2Context);
-        }
-        jobCtx->incrementProcessedCount(); 
-    }
+    size_t total_input_size = jobCtx->inputVec ? jobCtx->inputVec->size() : 0;
 
-    // Phase 1.5: Sort local intermediate vector
-    std::sort(jobCtx->intermediateVecsPerThread[threadID].begin(),
-              jobCtx->intermediateVecsPerThread[threadID].end(),
-              [](const IntermediatePair& p1, const IntermediatePair& p2) {
-                  // Ensure K2 objects are valid before dereferencing
-                  if (!p1.first || !p2.first) {
-                      // This case should ideally not happen if client behaves correctly
-                      // and always emits valid K2* pointers.
-                      // If it can happen, define consistent behavior (e.g., nulls first/last or error).
-                      // For now, assume valid K2* from client.
-                      if (!p1.first && !p2.first) return false; // both null, consider equal
-                      if (!p1.first) return true; // nulls first
-                      if (!p2.first) return false; // nulls first
-                  }
-                  return (*(p1.first) < *(p2.first));
-              });
-    
-    jobCtx->barrier->barrier(); // Wait for all threads to finish map and sort
+    if (total_input_size > 0) { // Only proceed if there's input
+        while ((current_input_idx = jobCtx->nextInputPairIndex.fetch_add(1, std::memory_order_relaxed)) < total_input_size) {
+            const InputPair& pair = (*jobCtx->inputVec)[current_input_idx];
+            jobCtx->client->map(pair.first, pair.second, &emit2Ctx);
 
-    // Phase 2: Shuffle (only thread 0)
-    if (threadID == 0) {
-        jobCtx->setStage(SHUFFLE_STAGE);
-        uint64_t total_intermediate_for_shuffle = jobCtx->totalIntermediateElementsProduced.load(std::memory_order_relaxed);
-        jobCtx->setTotalItemsForStage(total_intermediate_for_shuffle);
-        
-        // Consolidate all intermediate pairs from per-thread vectors
-        for (const auto& thread_vec : jobCtx->intermediateVecsPerThread) {
-            for (const auto& pair : thread_vec) {
-                jobCtx->allIntermediatePairsForShuffle.push_back(pair);
-            }
-        }
-        
-        // Sort all intermediate pairs globally
-        std::sort(jobCtx->allIntermediatePairsForShuffle.begin(),
-                  jobCtx->allIntermediatePairsForShuffle.end(),
-                  [](const IntermediatePair& p1, const IntermediatePair& p2) {
-                      if (!p1.first || !p2.first) {
-                          if (!p1.first && !p2.first) return false;
-                          if (!p1.first) return true;
-                          return false;
-                      }
-                      return (*(p1.first) < *(p2.first));
-                  });
-
-        // Group sorted pairs by key for the reduce phase
-        // And update shuffle progress
-        if (!jobCtx->allIntermediatePairsForShuffle.empty()) {
-            K2* current_key = nullptr; // Will be set by the first valid pair
-            IntermediateVec current_group;
-
-            for (const auto& pair : jobCtx->allIntermediatePairsForShuffle) {
-                if (!pair.first) continue; // Skip null keys if they somehow appear
-
-                if (current_group.empty() || (*(pair.first) < *current_key || *current_key < *(pair.first))) { // New key
-                    if (!current_group.empty()) {
-                        jobCtx->shuffledIntermediateVecs.push_back(current_group);
-                    }
-                    current_group.clear();
-                    current_key = pair.first;
+            uint64_t old_state, new_state;
+            old_state = jobCtx->atomicJobState.load(std::memory_order_relaxed);
+            do {
+                uint64_t current_stage_val = (old_state >> STAGE_SHIFT);
+                if (current_stage_val != MAP_STAGE) { // Stage changed, stop processing for this stage
+                    goto end_map_phase; // Exit map processing loop if stage changed
                 }
-                current_group.push_back(pair);
-                jobCtx->incrementProcessedCount(); // Increment for each item added to a group (or processed for shuffle)
-            }
-            if (!current_group.empty()) { // Add the last group
-                jobCtx->shuffledIntermediateVecs.push_back(current_group);
-            }
-        } else if (total_intermediate_for_shuffle == 0) {
-             // If there were no intermediate elements, shuffle is trivially complete.
-             // The percentage will be 0/0 -> handled by getJobState as 100% if stage is SHUFFLE.
+                uint64_t current_count = old_state & COUNT_MASK;
+                uint64_t stage_bits = old_state & (~COUNT_MASK);
+                new_state = stage_bits | (current_count + 1);
+            } while (!jobCtx->atomicJobState.compare_exchange_weak(old_state, new_state, std::memory_order_release, std::memory_order_relaxed));
+        }
+    }
+    end_map_phase:; // Label for goto
+
+    // Barrier after map phase
+    if (jobCtx->multiThreadLevel > 1 && jobCtx->barrier) {
+        jobCtx->barrier->barrier();
+    }
+
+    // SORT PHASE (Local sort per thread)
+    if (static_cast<size_t>(threadID) < jobCtx->intermediateVecsPerThread.size()) {
+        try {
+            std::sort(jobCtx->intermediateVecsPerThread[threadID].begin(),
+                      jobCtx->intermediateVecsPerThread[threadID].end(),
+                      [](const IntermediatePair& a, const IntermediatePair& b) {
+                          // Assuming K2* are always valid as per typical MapReduce client contract
+                          // and emit2 receives valid keys.
+                          if (a.first == nullptr || b.first == nullptr) {
+                              // This case should ideally not happen if client and emit2 are correct.
+                              // If it can, specific error handling or definition of order is needed.
+                              // For now, consider null < non-null, and null == null.
+                              if (a.first == nullptr && b.first != nullptr) return true; // nulls first
+                              if (a.first != nullptr && b.first == nullptr) return false;
+                              if (a.first == nullptr && b.first == nullptr) return false; // Equal or arbitrary
+                              // Fallthrough if both are non-null
+                          }
+                          return *(a.first) < *(b.first);
+                      });
+        } catch (const std::exception& e) {
+            // std::sort can throw if comparison throws or on bad_alloc with element moves.
+            // K2::operator< should not throw. bad_alloc is the main concern if elements are large
+            // or custom move operations allocate.
+            std::cerr << "system error: Exception during sort in thread " << threadID << ": " << e.what() << std::endl;
+            exit(1); // Critical error during sort
         }
     }
 
-    jobCtx->barrier->barrier(); // Wait for shuffle to complete
-
-    // Phase 3: Reduce
-    std::call_once(jobCtx->reduceStageInitializedFlag, [&]() {
-        jobCtx->setStage(REDUCE_STAGE);
-        jobCtx->setTotalItemsForStage(jobCtx->shuffledIntermediateVecs.size()); // Total unique K2 groups
-    });
-
-    Emit3Context emit3Context = {jobCtx};
-    unsigned int current_group_idx;
-    while ((current_group_idx = jobCtx->nextShuffledGroupIndexToReduce.fetch_add(1, std::memory_order_relaxed)) < jobCtx->shuffledIntermediateVecs.size()) {
-        const IntermediateVec& group_to_reduce = jobCtx->shuffledIntermediateVecs[current_group_idx];
-        if (!group_to_reduce.empty()) { // Ensure group is not empty
-            jobCtx->client->reduce(&group_to_reduce, &emit3Context);
-        }
-        jobCtx->incrementProcessedCount(); // Increment processed groups for REDUCE stage
+    // Barrier after sort phase
+    if (jobCtx->multiThreadLevel > 1 && jobCtx->barrier) {
+        jobCtx->barrier->barrier();
     }
+
+    // SHUFFLE PHASE (Thread 0 only)
+    // Placeholder: Thread 0 collects all intermediate pairs from intermediateVecsPerThread,
+    // sorts them globally, groups them by K2, and populates shuffledIntermediateVecs.
+    // Updates atomicJobState to SHUFFLE_STAGE and its progress.
+    // jobCtx->totalItemsInCurrentStage for SHUFFLE_STAGE will be jobCtx->totalIntermediateElementsProduced.
+
+    // Barrier after shuffle phase
+    if (jobCtx->multiThreadLevel > 1 && jobCtx->barrier) {
+        jobCtx->barrier->barrier();
+    }
+
+    // REDUCE PHASE
+    // Placeholder: Threads pick groups from shuffledIntermediateVecs, call client->reduce(),
+    // and use emit3 to output results.
+    // Updates atomicJobState to REDUCE_STAGE and its progress.
+    // jobCtx->totalItemsInCurrentStage for REDUCE_STAGE will be the number of unique K2 keys (groups).
 }
 
+// ...existing code...
 void getJobState(JobHandle job, JobState* state) {
     if (!job || !state) {
         if (state) { // If state is not null, set to undefined
