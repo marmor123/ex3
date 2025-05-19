@@ -280,12 +280,102 @@ void workerThreadRoutine(JobContext* jobCtx, int threadID) {
     }
 
     // SHUFFLE PHASE (Thread 0 only)
-    // Placeholder: Thread 0 collects all intermediate pairs from intermediateVecsPerThread,
-    // sorts them globally, groups them by K2, and populates shuffledIntermediateVecs.
-    // Updates atomicJobState to SHUFFLE_STAGE and its progress.
-    // jobCtx->totalItemsInCurrentStage for SHUFFLE_STAGE will be jobCtx->totalIntermediateElementsProduced.
+    if (threadID == 0) {
+        // 1. Initialize Shuffle Stage state
+        uint64_t total_intermediate_items = jobCtx->totalIntermediateElementsProduced.load(std::memory_order_relaxed);
+        jobCtx->totalItemsInCurrentStage.store(total_intermediate_items, std::memory_order_relaxed);
+        
+        uint64_t shuffle_stage_val = (get_stage_val(SHUFFLE_STAGE) << STAGE_SHIFT); // count is 0
+        jobCtx->atomicJobState.store(shuffle_stage_val, std::memory_order_release);
 
-    // Barrier after shuffle phase
+        // 2. Collect all intermediate pairs and update progress.
+        try {
+            if (total_intermediate_items > 0) { // Avoid reserving if nothing was produced
+                 jobCtx->allIntermediatePairsForShuffle.reserve(total_intermediate_items);
+            }
+        } catch (const std::bad_alloc& e) {
+            std::cerr << "system error: Failed to reserve memory for allIntermediatePairsForShuffle: " << e.what() << std::endl;
+            exit(1);
+        }
+
+        for (size_t i = 0; i < jobCtx->intermediateVecsPerThread.size(); ++i) {
+            IntermediateVec& thread_vec = jobCtx->intermediateVecsPerThread[i];
+            if (!thread_vec.empty()) {
+                for (const IntermediatePair& pair : thread_vec) {
+                    try {
+                        jobCtx->allIntermediatePairsForShuffle.push_back(pair);
+                    } catch (const std::bad_alloc& e) {
+                        std::cerr << "system error: Failed to push_back to allIntermediatePairsForShuffle: " << e.what() << std::endl;
+                        exit(1);
+                    }
+                    // Update progress for each pair added
+                    uint64_t old_state, new_state;
+                    old_state = jobCtx->atomicJobState.load(std::memory_order_relaxed);
+                    do {
+                        // Stage should remain SHUFFLE_STAGE, count increments.
+                        uint64_t current_count = old_state & COUNT_MASK;
+                        new_state = shuffle_stage_val | (current_count + 1); // Assumes shuffle_stage_val has 0 count
+                    } while (!jobCtx->atomicJobState.compare_exchange_weak(old_state, new_state, std::memory_order_release, std::memory_order_relaxed));
+                }
+                thread_vec.clear(); // Free memory from per-thread vectors after collection
+                // thread_vec.shrink_to_fit(); // More aggressive, consider if memory is critical
+            }
+        }
+
+        // 3. Global Sort of allIntermediatePairsForShuffle
+        try {
+            std::sort(jobCtx->allIntermediatePairsForShuffle.begin(),
+                      jobCtx->allIntermediatePairsForShuffle.end(),
+                      [](const IntermediatePair& a, const IntermediatePair& b) {
+                          if (a.first == nullptr || b.first == nullptr) {
+                              if (a.first == nullptr && b.first != nullptr) return true;
+                              if (a.first != nullptr && b.first == nullptr) return false;
+                              if (a.first == nullptr && b.first == nullptr) return false; 
+                          }
+                          return *(a.first) < *(b.first);
+                      });
+        } catch (const std::exception& e) {
+            std::cerr << "system error: Exception during global sort in shuffle phase: " << e.what() << std::endl;
+            exit(1);
+        }
+
+        // 4. Group sorted pairs by K2 into shuffledIntermediateVecs
+        if (!jobCtx->allIntermediatePairsForShuffle.empty()) {
+            try {
+                jobCtx->shuffledIntermediateVecs.emplace_back();
+                jobCtx->shuffledIntermediateVecs.back().push_back(jobCtx->allIntermediatePairsForShuffle[0]);
+
+                for (size_t i = 1; i < jobCtx->allIntermediatePairsForShuffle.size(); ++i) {
+                    const K2* current_key = jobCtx->allIntermediatePairsForShuffle[i].first;
+                    const K2* prev_key = jobCtx->allIntermediatePairsForShuffle[i-1].first;
+                    
+                    bool new_key_group = false;
+                    if (prev_key == nullptr && current_key == nullptr) {
+                        new_key_group = false; // Both null, same group
+                    } else if (prev_key == nullptr || current_key == nullptr) {
+                        new_key_group = true;  // One is null, different groups
+                    } else { // Both non-null, compare them
+                        // If neither is less than the other, they are equivalent for grouping
+                        if (*prev_key < *current_key || *current_key < *prev_key) {
+                            new_key_group = true;
+                        }
+                    }
+
+                    if (new_key_group) {
+                        jobCtx->shuffledIntermediateVecs.emplace_back(); 
+                    }
+                    jobCtx->shuffledIntermediateVecs.back().push_back(jobCtx->allIntermediatePairsForShuffle[i]);
+                }
+            } catch (const std::bad_alloc& e) {
+                std::cerr << "system error: Failed to allocate memory during grouping in shuffle phase: " << e.what() << std::endl;
+                exit(1);
+            }
+            // jobCtx->allIntermediatePairsForShuffle.clear(); // Free memory after grouping
+            // jobCtx->allIntermediatePairsForShuffle.shrink_to_fit();
+        }
+    } // End of if (threadID == 0) for shuffle
+
+    // Barrier after shuffle phase (all threads wait here)
     if (jobCtx->multiThreadLevel > 1 && jobCtx->barrier) {
         jobCtx->barrier->barrier();
     }
