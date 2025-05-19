@@ -68,19 +68,34 @@ public:
 
 int main(int argc, char** argv)
 {
-	CounterClient client;
-	InputVec inputVec;
-	OutputVec outputVec;
-	VString s1("This string is full of characters");
-	VString s2("Multithreading is awesome");
-	VString s3("race conditions are bad");
-	inputVec.push_back({nullptr, &s1});
-	inputVec.push_back({nullptr, &s2});
-	inputVec.push_back({nullptr, &s3});
-	JobState state;
+	// START OF FRAMEWORK USAGE
+
+    //init the framework
+    CounterClient client;
+    InputVec inputVec;
+    OutputVec outputVec;
+
+	VString s1("The quick brown fox jumps over the lazy dog");
+	VString s2("Lorem ipsum dolor sit amet, consectetur adipiscing elit.");
+	VString s3("Sed do eiusmod tempor incididunt ut labore et dolore magna aliqua.");
+	VString s4("Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat.");
+	VString s5("Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur.");
+
+    for (int i = 0; i < 20; ++i) {
+        inputVec.push_back({nullptr, &s1});
+        inputVec.push_back({nullptr, &s2});
+        inputVec.push_back({nullptr, &s3});
+        inputVec.push_back({nullptr, &s4});
+        inputVec.push_back({nullptr, &s5});
+    }
+	//end of data generation
+
+    //start job
+    JobHandle job = startMapReduceJob(client, inputVec, outputVec, 10); // Increased multiThreadLevel to 10
+
+    JobState state;
+    getJobState(job, &state);
     JobState last_state={UNDEFINED_STAGE,0};
-	JobHandle job = startMapReduceJob(client, inputVec, outputVec, 4);
-	getJobState(job, &state);
     
 	while (state.stage != REDUCE_STAGE || state.percentage != 100.0)
 	{
