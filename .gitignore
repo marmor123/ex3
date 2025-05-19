@@ -1,0 +1,16 @@
+# Compiled files
+*.o
+*.a
+*.so
+*.dll
+
+# Executables
+sample
+barrierdemo
+
+# VS Code specific
+.vscode/
+
+# OS generated files
+.DS_Store
+Thumbs.db
