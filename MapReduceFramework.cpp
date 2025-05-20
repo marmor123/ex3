@@ -327,11 +327,8 @@ void workerThreadRoutine(JobContext* jobCtx, int threadID) {
         
         jobCtx->client->reduce(currentGroup, &emit3Context);
 
-        // Update progress for REDUCE_STAGE (increment processed group count)
-        // This fetch_add is on the whole atomicJobState. It relies on the fact that
-        // adding 1 will only affect the lower 62 bits (the count) and not the stage bits.
-        // This is safe as long as the count doesn't overflow into the stage bits.
-        jobCtx->atomicJobState.fetch_add(1, std::memory_order_acq_rel);
+        // Update progress for REDUCE_STAGE
+        jobCtx->atomicJobState.fetch_add(1, std::memory_order_release); // Changed from acq_rel to release
     }
 
     jobCtx->barrier->barrier(); // Wait for all threads to finish Reduce phase
