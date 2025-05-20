@@ -192,7 +192,7 @@ void workerThreadRoutine(JobContext* jobCtx, int threadID) {
         if (jobCtx->inputVec->empty()) { // Handle empty input
              initial_state |= COUNT_MASK; // Mark as 100%
         }
-        jobCtx->atomicJobState.store(initial_state);
+        jobCtx->atomicJobState.store(initial_state, std::memory_order_release); // Use release order
         jobCtx->nextInputPairIndex.store(0, std::memory_order_relaxed);
     });
 
@@ -232,13 +232,13 @@ void workerThreadRoutine(JobContext* jobCtx, int threadID) {
     if (threadID == 0) {
         // 1. Set stage to SHUFFLE and total items for shuffle
         uint64_t total_intermediate_items = jobCtx->totalIntermediateElementsProduced.load(std::memory_order_relaxed);
-        jobCtx->totalItemsInCurrentStage.store(total_intermediate_items);
+        jobCtx->totalItemsInCurrentStage.store(total_intermediate_items); // This is for internal use by shuffle progress itself if needed
         
         uint64_t initial_shuffle_state = (get_stage_val(SHUFFLE_STAGE) << STAGE_SHIFT);
         if (total_intermediate_items == 0) {
             initial_shuffle_state |= COUNT_MASK; // Mark as 100% if no items
         }
-        jobCtx->atomicJobState.store(initial_shuffle_state);
+        jobCtx->atomicJobState.store(initial_shuffle_state, std::memory_order_release); // Use release order
         
         uint64_t shuffle_processed_count = 0;
 
@@ -250,6 +250,8 @@ void workerThreadRoutine(JobContext* jobCtx, int threadID) {
                 // Update shuffle progress for each pair collected
                 shuffle_processed_count++;
                 if (total_intermediate_items > 0) { // Avoid division by zero if no items
+                     // This store is for shuffle progress, stage is already SHUFFLE_STAGE
+                     // Using relaxed is fine as it's within the same stage, by the same thread.
                      jobCtx->atomicJobState.store((get_stage_val(SHUFFLE_STAGE) << STAGE_SHIFT) | shuffle_processed_count, std::memory_order_relaxed);
                 }
             }
@@ -257,9 +259,9 @@ void workerThreadRoutine(JobContext* jobCtx, int threadID) {
         }
         
         // If total_intermediate_items was 0, state is already 100%. Otherwise, if loop finished, it's 100%.
+        // Ensure the final count for shuffle stage is correctly set if it wasn't empty.
         if (total_intermediate_items > 0 && shuffle_processed_count == total_intermediate_items) {
-             // Ensure it's marked as fully processed if all items were handled.
-             // This might be redundant if the loop updates correctly, but serves as a finalizer.
+             jobCtx->atomicJobState.store((get_stage_val(SHUFFLE_STAGE) << STAGE_SHIFT) | shuffle_processed_count, std::memory_order_relaxed);
         }
 
 
@@ -345,26 +347,49 @@ void getJobState(JobHandle job, JobState* state) {
     }
 
     JobContext* jobCtx = static_cast<JobContext*>(job);
-    uint64_t current_atomic_state = jobCtx->atomicJobState.load(std::memory_order_relaxed);
+    uint64_t current_atomic_state = jobCtx->atomicJobState.load(std::memory_order_acquire); // Use acquire order
 
     state->stage = static_cast<stage_t>((current_atomic_state >> STAGE_SHIFT));
     uint64_t processed_count = current_atomic_state & COUNT_MASK;
-    uint64_t total_for_stage = jobCtx->totalItemsInCurrentStage.load(std::memory_order_relaxed);
+    
+    uint64_t actual_total_for_stage_read;
 
-    if (total_for_stage == 0) {
-        // If the stage is active (MAP, SHUFFLE, REDUCE), it's 100% complete.
-        // If the stage is UNDEFINED, it's 0%.
-        // This handles cases like empty inputVec (MAP stage, 0 total, 100%),
-        // or no intermediate elements (SHUFFLE stage, 0 total, 100%).
+    switch (state->stage) {
+        case UNDEFINED_STAGE:
+            actual_total_for_stage_read = 0;
+            break;
+        case MAP_STAGE:
+            actual_total_for_stage_read = jobCtx->inputVec->size();
+            break;
+        case SHUFFLE_STAGE:
+            actual_total_for_stage_read = jobCtx->totalIntermediateElementsProduced.load(std::memory_order_relaxed);
+            break;
+        case REDUCE_STAGE:
+            // shuffledIntermediateVecs.size() is stable after shuffle barrier and before reduce phase fully completes.
+            // Accessing shuffledIntermediateVecs here is safe as it's populated by thread 0
+            // and then only read by reducer threads or this getJobState.
+            actual_total_for_stage_read = jobCtx->shuffledIntermediateVecs.size(); 
+            break;
+        default: // Should not happen
+            actual_total_for_stage_read = 0;
+            break;
+    }
+
+    if (processed_count == COUNT_MASK && state->stage != UNDEFINED_STAGE) { // Explicit 100% marker
+        state->percentage = 100.0f;
+    } else if (actual_total_for_stage_read == 0) {
+        // If total is 0, stage is 100% (unless UNDEFINED_STAGE).
+        // This covers empty input for map, no intermediate for shuffle, no groups for reduce.
         state->percentage = (state->stage == UNDEFINED_STAGE) ? 0.0f : 100.0f;
     } else {
-        state->percentage = (static_cast<float>(processed_count) / total_for_stage) * 100.0f;
+        state->percentage = (static_cast<float>(processed_count) / actual_total_for_stage_read) * 100.0f;
     }
     
-    // Ensure percentage does not exceed 100%
+    // Clamp percentage in case of floating point inaccuracies or if processed_count somehow exceeds actual_total.
     if (state->percentage > 100.0f) {
         state->percentage = 100.0f;
     }
+    // It should not be less than 0 if counts are positive.
 }
 
 void waitForJob(JobHandle job) {
